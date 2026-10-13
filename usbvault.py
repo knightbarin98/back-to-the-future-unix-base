@@ -10,6 +10,7 @@ deleting anything.
   install-daemon   run 'watch' in the background (launchd on macOS, systemd on Linux)
   status           this computer, the USB and what is still pending
   verify           re-read every file on the USB and compare checksums
+  extras add PATH  also back up a folder or file (extras list / extras remove PATH)
   config           show the settings file
 
 Rules, the same on every computer:
@@ -22,6 +23,8 @@ Rules, the same on every computer:
   * videos, ISOs, installers and archives over 1 GB are never copied
   * ~/Documents/code and git repositories are left alone
   * logs and a copy of the database live in ~/Documents/TimeIsRelative
+  * extra folders/files you list go to VAULT/Extras/<computer>/...; they are
+    copied (same exclusions inside folders) but never moved
   * the Mac only sends to the USB; Ubuntu and EndeavourOS sync both ways
   * nothing is ever deleted, and the databases only add and update rows
 
@@ -81,6 +84,10 @@ TIME_KEY = "Documents/TimeIsRelative"          # logs, local database, catalogue
 OLD_KEY = "Documents/OldWorld"                 # DICOM studies, never copied
 CSV_KEY = f"{CLONES_KEY}/duplicates.csv"       # generated report, written on each side
 NO_SYNC_KEYS = {TIME_KEY, OLD_KEY, CSV_KEY}
+# Extra folders/files you list (extras add PATH) go to VAULT/Extras/<computer>/<path
+# from your home>; paths outside your home go under .../_root/<absolute path>.
+EXTRAS = "Extras"
+ROOT_MARK = "_root"
 
 # OS clutter that is never copied.
 JUNK_NAMES = {
@@ -302,7 +309,23 @@ def default_config() -> dict:
         "archive_limit_bytes": 1_000_000_000,
         "freeze_after_days": 183,
         "settle_seconds": 30,
+        "extra_paths": [],
     }
+
+
+def extras_prefix() -> str:
+    """This computer's folder on the USB for its extra paths."""
+    return f"{EXTRAS}/{safe_name(HOST)}"
+
+
+def path_key(p) -> str:
+    p = os.path.abspath(os.path.expanduser(str(p)))
+    return p.casefold() if IS_MAC else p  # APFS is case-insensitive
+
+
+def path_inside(child, parent) -> bool:
+    c, par = path_key(child), path_key(parent)
+    return c == par or c.startswith(par.rstrip(os.sep) + os.sep)
 
 
 @dataclass
@@ -319,18 +342,60 @@ class Config:
     archive_limit: int
     freeze_days: int
     settle: int
+    extras: list = field(default_factory=list)          # extra paths in use (absolute Paths)
+    extra_warnings: list = field(default_factory=list)  # listed paths that are ignored, and why
 
     @staticmethod
     def _key(p: str) -> str:
-        p = os.path.abspath(os.path.expanduser(p))
-        return p.casefold() if IS_MAC else p  # APFS is case-insensitive
+        return path_key(p)
 
     def local(self, key: str) -> Path:
         top, _, rest = key.partition("/")
+        if top == EXTRAS:
+            host, _, rest = rest.partition("/")
+            if host != safe_name(HOST):
+                raise KeyError(key)  # another computer's extras
+            if rest == ROOT_MARK or rest.startswith(ROOT_MARK + "/"):
+                return Path("/" + rest[len(ROOT_MARK) + 1:])
+            return Path.home() / rest if rest else Path.home()
         if top not in self.folders:
             raise KeyError(key)
         base = self.folders[top]
         return base / rest if rest else base
+
+    def extra_key(self, p: Path) -> str:
+        try:
+            rel = p.relative_to(Path.home()).as_posix()
+        except ValueError:
+            rel = f"{ROOT_MARK}/{p.as_posix().lstrip('/')}"
+        return f"{extras_prefix()}/{rel}"
+
+    @property
+    def extra_keys(self) -> list:
+        return [self.extra_key(p) for p in self.extras]
+
+    def is_extra_key(self, key: str) -> bool:
+        return any(under(key, k) for k in self.extra_keys)
+
+    def extra_problem(self, p: Path):
+        """Why p can't be an extra path, or None when it can."""
+        if path_key(p) in (path_key(Path.home()), path_key("/")):
+            return "that is your whole home folder (or disk); list specific folders or files"
+        for top, root in self.folders.items():
+            if path_inside(root, p):
+                return f"it contains ~/{top}, which is already backed up; list specific folders inside it instead"
+            if path_inside(p, root):
+                if path_inside(p, self.local(TIME_KEY)) or path_inside(p, self.local(OLD_KEY)):
+                    return "TimeIsRelative and OldWorld are never copied (your rules)"
+                if any(path_inside(p, ep) for ep in self.exclude_paths):
+                    return None  # e.g. inside ~/Documents/code: allowed, it is not synced otherwise
+                d = p if p.is_dir() else p.parent
+                while path_inside(d, root) and path_key(d) != path_key(root):
+                    if (d / ".git").exists():
+                        return None  # inside a git repository: allowed, it is not synced otherwise
+                    d = d.parent
+                return f"it is inside ~/{top}, which is already backed up"
+        return None
 
     def excluded_path(self, path: str) -> bool:
         return self._key(path) in self.exclude_paths
@@ -385,7 +450,7 @@ def load_config(announce=True) -> Config:
                if k in ("Documents", "Downloads")}
     if "Documents" not in folders:
         die(f"{path} must list a Documents folder")
-    return Config(
+    cfg = Config(
         path=path, role=role, usb_label=raw["usb_label"], folders=folders,
         exclude_paths={Config._key(p) for p in raw["exclude_paths"]},
         skip_git_repos=bool(raw["skip_git_repos"]),
@@ -394,6 +459,14 @@ def load_config(announce=True) -> Config:
         archive_limit=int(raw["archive_limit_bytes"]), freeze_days=int(raw["freeze_after_days"]),
         settle=int(raw["settle_seconds"]),
     )
+    for item in raw.get("extra_paths", []):
+        p = Path(os.path.abspath(os.path.expanduser(item)))
+        problem = cfg.extra_problem(p)
+        if problem:
+            cfg.extra_warnings.append(f"{item}: ignored, {problem}")
+        else:
+            cfg.extras.append(p)
+    return cfg
 
 
 # --------------------------------------------------------------------- file ops
@@ -948,7 +1021,9 @@ class Entry:
     st: object
     is_dir: bool
     usb_key: str
-    excluded: bool = False  # stays on this computer only (video, installer, big archive)
+    excluded: bool = False  # stays on this computer only (video, installer, big archive, DICOM)
+    extra: bool = False     # one of your extra paths: copied, never moved
+    explicit: bool = False  # a file you listed by name: always copied
 
 
 @dataclass
@@ -956,6 +1031,7 @@ class Report:
     errors: list = field(default_factory=list)
     skipped: list = field(default_factory=list)
     renamed: list = field(default_factory=list)
+    unavailable: list = field(default_factory=list)  # extra paths that don't exist right now
     scan_failed: bool = False
 
     def error(self, where, err):
@@ -964,71 +1040,101 @@ class Report:
         ui.log(f"ERROR {msg}")
 
 
+def _walk(cfg: Config, report: Report, out: dict, root: str, key: str, ukey: str, extra: bool):
+    """Add everything under root to out. In Documents/Downloads, ~/Documents/code
+    and git repositories are left alone; inside an extra folder you listed, only
+    the excluded folder names (node_modules, .git, ...) are skipped."""
+    stack = [(root, key, ukey)]
+    while stack:
+        path, key, ukey = stack.pop()
+        try:
+            with os.scandir(path) as it:
+                entries = sorted(it, key=lambda e: e.name)
+        except OSError as e:
+            report.error(path, e)
+            report.scan_failed = True
+            continue
+        used = set()
+        for e in entries:
+            name = e.name
+            if is_junk(name) or is_partial(name):
+                continue
+            child = f"{key}/{name}"
+            if child in NO_SYNC_KEYS:
+                continue
+            try:
+                if e.is_symlink():
+                    report.skipped.append(f"{child} (symlink)")
+                    continue
+                is_dir = e.is_dir(follow_symlinks=False)
+                if is_dir:
+                    if cfg.excluded_dir(name) or (not extra and cfg.excluded_path(e.path)):
+                        report.skipped.append(f"{child} (excluded folder)")
+                        continue
+                    if not extra and cfg.skip_git_repos and os.path.lexists(os.path.join(e.path, ".git")):
+                        report.skipped.append(f"{child} (git repository)")
+                        continue
+                    if is_vault(Path(e.path)):
+                        continue  # never back up the USB into itself
+                elif not e.is_file(follow_symlinks=False):
+                    continue
+                st = e.stat(follow_symlinks=False)
+            except OSError as err:
+                report.error(e.path, err)
+                continue
+            excluded = not is_dir and cfg.excluded_file(name, st.st_size)
+            uname = safe_name(name)
+            if not excluded:
+                base, n = uname, 2
+                while uname.casefold() in used:  # exFAT is case-insensitive
+                    uname = numbered(base, n)
+                    n += 1
+                used.add(uname.casefold())
+                if uname != unicodedata.normalize("NFC", name):
+                    report.renamed.append(f"{child} -> {uname}")
+            entry = Entry(child, e.path, st, is_dir, f"{ukey}/{uname}", excluded, extra)
+            out[child] = entry
+            if is_dir:
+                stack.append((e.path, child, entry.usb_key))
+
+
 def scan_local(cfg: Config, report: Report) -> dict:
-    """Every file and folder under ~/Documents and ~/Downloads that this program
-    manages, keyed like 'Documents/Facturas/enero.xml'."""
+    """Every file and folder this program manages on this computer: ~/Documents,
+    ~/Downloads and your extra paths, keyed like 'Documents/Facturas/enero.xml'
+    or 'Extras/<computer>/Pictures/Scans/a.jpg'."""
     out = {}
     for top in cfg.folders:
         root = cfg.local(top)
-        if not root.is_dir():
+        if root.is_dir():
+            _walk(cfg, report, out, str(root), top, top, extra=False)
+    for p in cfg.extras:
+        key = cfg.extra_key(p)
+        ukey = "/".join(safe_name(part) for part in key.split("/"))
+        try:
+            st = os.stat(p, follow_symlinks=False)
+        except OSError:
+            report.unavailable.append(key)
             continue
-        stack = [(str(root), top, top)]
-        while stack:
-            path, key, ukey = stack.pop()
-            try:
-                with os.scandir(path) as it:
-                    entries = sorted(it, key=lambda e: e.name)
-            except OSError as e:
-                report.error(path, e)
-                report.scan_failed = True
-                continue
-            used = set()
-            for e in entries:
-                name = e.name
-                if is_junk(name) or is_partial(name):
-                    continue
-                child = f"{key}/{name}"
-                if child in NO_SYNC_KEYS:
-                    continue
-                try:
-                    if e.is_symlink():
-                        report.skipped.append(f"{child} (symlink)")
-                        continue
-                    is_dir = e.is_dir(follow_symlinks=False)
-                    if is_dir:
-                        if cfg.excluded_path(e.path) or cfg.excluded_dir(name):
-                            report.skipped.append(f"{child} (excluded folder)")
-                            continue
-                        if cfg.skip_git_repos and os.path.lexists(os.path.join(e.path, ".git")):
-                            report.skipped.append(f"{child} (git repository)")
-                            continue
-                    elif not e.is_file(follow_symlinks=False):
-                        continue
-                    st = e.stat(follow_symlinks=False)
-                except OSError as err:
-                    report.error(e.path, err)
-                    continue
-                excluded = not is_dir and cfg.excluded_file(name, st.st_size)
-                uname = safe_name(name)
-                if not excluded:
-                    base, n = uname, 2
-                    while uname.casefold() in used:  # exFAT is case-insensitive
-                        uname = numbered(base, n)
-                        n += 1
-                    used.add(uname.casefold())
-                    if uname != unicodedata.normalize("NFC", name):
-                        report.renamed.append(f"{child} -> {uname}")
-                entry = Entry(child, e.path, st, is_dir, f"{ukey}/{uname}", excluded)
-                out[child] = entry
-                if is_dir:
-                    stack.append((e.path, child, entry.usb_key))
+        if stat_mod.S_ISDIR(st.st_mode):
+            out[key] = Entry(key, str(p), st, True, ukey, extra=True)
+            _walk(cfg, report, out, str(p), key, ukey, extra=True)
+        elif stat_mod.S_ISREG(st.st_mode):
+            out[key] = Entry(key, str(p), st, False, ukey, extra=True, explicit=True)
+        else:
+            report.skipped.append(f"{tilde(p)} (not a regular file or folder)")
     return out
 
 
-def scan_usb(usb: Path, cfg: Config) -> dict:
-    """Files (stat) and folders (None) under VAULT/Documents and VAULT/Downloads."""
+def scan_usb(usb: Path, cfg: Config, extras="own") -> dict:
+    """Files (stat) and folders (None) under VAULT/Documents, VAULT/Downloads and
+    VAULT/Extras/<this computer> (extras="all": every computer's extras)."""
     out = {}
-    for top in cfg.folders:
+    roots = list(cfg.folders)
+    if extras == "own":
+        roots.append(extras_prefix())
+    elif extras == "all":
+        roots.append(EXTRAS)
+    for top in roots:
         root = usb / top
         if not root.is_dir():
             continue
@@ -1057,6 +1163,20 @@ def scan_usb(usb: Path, cfg: Config) -> dict:
                 except OSError:
                     continue
     return out
+
+
+def usb_tracked(cfg: Config, path: str) -> bool:
+    """Whether this computer's sync is responsible for a USB catalogue path."""
+    return path.split("/", 1)[0] in cfg.folders or under(path, extras_prefix())
+
+
+def mark_dicom_excluded(entries: dict, rows: dict):
+    """DICOM files found inside extra folders are never copied (in Documents and
+    Downloads they move to OldWorld instead)."""
+    for k, e in entries.items():
+        r = rows.get(k)
+        if not e.is_dir and not e.explicit and r is not None and r["dicom"] == 1:
+            e.excluded = True
 
 
 # ------------------------------------------------------------------ the session
@@ -1204,9 +1324,14 @@ def local_phase(sess: Session, initial: bool, report: Report) -> Tidy:
         return row["usb_path"] if row is not None and row["synced_size"] is not None else None
 
     # Missing files: marked deleted (logical); nothing is removed anywhere.
+    def still_watched(key):
+        if not under(key, EXTRAS):
+            return True
+        return cfg.is_extra_key(key) and not any(under(key, u) for u in report.unavailable)
+
     if not report.scan_failed:
         for key, row in rows.items():
-            if row["state"] == "present" and key not in entries:
+            if row["state"] == "present" and key not in entries and still_watched(key):
                 tidy.missing += 1
                 if apply:
                     ldb.put(key, state="deleted", deleted_at=now_iso())
@@ -1233,13 +1358,15 @@ def local_phase(sess: Session, initial: bool, report: Report) -> Tidy:
                 tidy.changed += 1
 
     # 1. DICOM -> OldWorld (never copied)
-    dicom_keys = {k for k, r in rows.items() if r["dicom"] == 1 and k in entries}
+    dicom_keys = {k for k, r in rows.items() if r["dicom"] == 1 and k in entries and not entries[k].extra}
     flags = {}
     for k in fresh:
         e = entries[k]
-        if not e.excluded:
+        if not e.excluded and not e.explicit:
             flags[k] = is_dicom(e.path, e.st, name_of(k))
-            if flags[k]:
+            if flags[k] and e.extra:
+                e.excluded = True  # DICOM inside an extra folder: not copied, not moved
+            elif flags[k]:
                 dicom_keys.add(k)
     for unit in dicom_units(dicom_keys, entries):
         inside = [e for k, e in entries.items() if under(k, unit) and not e.is_dir]
@@ -1264,7 +1391,7 @@ def local_phase(sess: Session, initial: bool, report: Report) -> Tidy:
     init_ts = float(ldb.meta("initialized_ts") or 0)
     candidates = []
     for k, e in entries.items():
-        if e.is_dir or under(k, FREEZE_KEY) or under(k, CLONES_KEY) or not settled(e):
+        if e.is_dir or e.extra or under(k, FREEZE_KEY) or under(k, CLONES_KEY) or not settled(e):
             continue
         row = rows.get(k)
         if init_ts and (row is None or (row["first_seen_ts"] or 0) > max(init_ts, cutoff)):
@@ -1307,7 +1434,7 @@ def local_phase(sess: Session, initial: bool, report: Report) -> Tidy:
 
     # 3. Identical content: the newest copy stays, older copies -> AttackOfTheClones
     hashes = {}
-    to_hash = [k for k in fresh if k in entries and not entries[k].excluded
+    to_hash = [k for k in fresh if k in entries and not entries[k].excluded and not entries[k].extra
                and not under(k, CLONES_KEY) and entries[k].st.st_size > 0]
     total = sum(entries[k].st.st_size for k in to_hash)
     done = 0
@@ -1339,7 +1466,8 @@ def local_phase(sess: Session, initial: bool, report: Report) -> Tidy:
         for k in new_keys:
             group.append(((0 if initial else 1, arrival(entries[k].st)), "local", k, entries[k].st.st_size))
         for k in ldb.keys_with_hash(digest):
-            if k in new_keys or k not in entries or under(k, CLONES_KEY) or entries[k].excluded:
+            if k in new_keys or k not in entries or under(k, CLONES_KEY) or entries[k].excluded \
+                    or entries[k].extra:
                 continue
             if ldb.cached_hash(k, entries[k].st) == digest:
                 group.append(((0, arrival(entries[k].st)), "local", k, entries[k].st.st_size))
@@ -1476,6 +1604,8 @@ def plan_sync(cfg: Config, entries: dict, usb_tree: dict, rows: dict, now: float
             R = rows.get(ukey)
             if R is not None and (R["state"] == "moved" or (R["state"] == "deleted" and R["synced_size"] is not None)):
                 continue  # moved or deleted on this computer on purpose: not brought back
+            if under(ukey, EXTRAS) and not cfg.is_extra_key(ukey):
+                continue  # only the extra paths this computer still lists come back to it
             if U is None:
                 actions.append(Action("mkdir_local", ukey, ukey))
             elif not cfg.excluded_file(name_of(ukey), U.st_size):
@@ -1560,11 +1690,13 @@ def sync_phase(sess: Session, usb: Path, report: Report) -> SyncResult:
             vdb.commit()
 
             entries = scan_local(cfg, Report())
+            rows = ldb.rows()
+            mark_dicom_excluded(entries, rows)
             usb_tree = scan_usb(usb, cfg)
             for p in vdb.live_paths() - set(usb_tree):
-                if p.split("/", 1)[0] in cfg.folders:
+                if usb_tracked(cfg, p):
                     vdb.mark_deleted(p, "no longer on the USB")
-            actions = plan_sync(cfg, entries, usb_tree, ldb.rows(), time.time())
+            actions = plan_sync(cfg, entries, usb_tree, rows, time.time())
             push_bytes = sum(a.size for a in actions if a.kind.startswith(("push", "resolve")))
             pull_bytes = sum(a.size for a in actions if a.kind.startswith("pull"))
             if push_bytes > shutil.disk_usage(usb).free * 0.98:
@@ -1872,6 +2004,10 @@ def cmd_first_run(args):
         ui.say(f"{'Copy this Mac to' if cfg.role == 'source' else 'Merge this computer with'} {usb}   "
                f"(computer: {HOST}, role: {cfg.role})")
         ui.say("Checking every file in Documents and Downloads (contents are read once to find duplicates)...")
+        for p in cfg.extras:
+            ui.say(f"Extra path: {describe_extra(cfg, p)}")
+        for w in cfg.extra_warnings:
+            ui.warn(w)
         report = Report()
         tidy = local_phase(sess, initial=True, report=report)
         print_skips(report)
@@ -1941,10 +2077,13 @@ def cmd_watch(args):
 
     signal.signal(signal.SIGTERM, on_term)
     ui.say(f"{now_iso()} usbvault watch started on {HOST} ({cfg.role}), every {args.interval}s")
+    for w in cfg.extra_warnings:
+        ui.warn(w)
     last_state = None
     try:
         while not stopping:
             try:
+                cfg = load_config(announce=False)  # picks up 'extras add/remove' without a restart
                 summary, state = run_cycle(cfg, args.vault)
                 if summary:
                     ui.say(f"{now_iso()} {summary}")
@@ -1992,6 +2131,12 @@ def cmd_status(args):
         if p.exists():
             n = sum(1 for f in p.rglob("*") if f.is_file())
             ui.say(f"  ~/{key}: {n:,} file(s)")
+    if cfg.extras:
+        ui.say("  extra paths backed up:")
+        for p in cfg.extras:
+            ui.say(f"    {describe_extra(cfg, p)}")
+    for w in cfg.extra_warnings:
+        ui.warn(w)
     usb, why = find_vault(cfg, args.vault)
     if not usb:
         ui.say(f"USB: {why}")
@@ -2018,7 +2163,7 @@ def cmd_verify(args):
     cfg = load_config(announce=False)
     usb = require_vault(cfg, args.vault)
     with file_lock(usb / VAULT_DIR / "lock", "the USB"):
-        tree = {k: st for k, st in scan_usb(usb, cfg).items() if st is not None}
+        tree = {k: st for k, st in scan_usb(usb, cfg, extras="all").items() if st is not None}
         vdb = VaultDB(usb)
         corrupt, added, done = [], 0, 0
         total = sum(st.st_size for st in tree.values())
@@ -2039,7 +2184,7 @@ def cmd_verify(args):
                     vdb.put_file(k, st, digest, file_metadata(st, name_of(k)), origin="verify")
                     added += 1
             for p in vdb.live_paths() - set(tree):
-                if p.split("/", 1)[0] in cfg.folders:
+                if p.split("/", 1)[0] in cfg.folders or under(p, EXTRAS):
                     vdb.mark_deleted(p, "no longer on the USB")
         except KeyboardInterrupt:
             ui.warn("interrupted")
@@ -2054,6 +2199,59 @@ def cmd_verify(args):
             ui.say(f"    {k}")
         return 1
     ui.say("All good: every file matches its checksum.")
+    return 0
+
+
+def describe_extra(cfg: Config, p: Path) -> str:
+    kind = "folder" if p.is_dir() else "file" if p.exists() else "not there right now"
+    return f"{tilde(p)}  ({kind})  ->  USB: {cfg.extra_key(p)}"
+
+
+def cmd_extras(args):
+    """List, add or remove extra folders/files to back up besides Documents and Downloads."""
+    cfg = load_config(announce=False)
+    raw = json.loads(cfg.path.read_text(encoding="utf-8"))
+    listed = raw.setdefault("extra_paths", [])
+    if args.action == "list":
+        if not listed:
+            ui.say("No extra paths. Add some with:  python usbvault.py extras add ~/Pictures/Scans ~/.zshrc")
+        for p in cfg.extras:
+            ui.say(f"  {describe_extra(cfg, p)}")
+        for w in cfg.extra_warnings:
+            ui.warn(w)
+        return 0
+    if not args.paths:
+        die(f"give one or more paths, e.g.  python usbvault.py extras {args.action} ~/Pictures/Scans")
+    changed = False
+    for item in args.paths:
+        p = Path(os.path.abspath(os.path.expanduser(item)))
+        stored = tilde(p)
+        present = [x for x in listed if path_key(x) == path_key(p)]
+        if args.action == "add":
+            problem = cfg.extra_problem(p)
+            if problem:
+                ui.warn(f"{stored} not added: {problem}")
+                continue
+            if present:
+                ui.say(f"{stored} is already listed.")
+                continue
+            listed.append(stored)
+            changed = True
+            if not p.exists():
+                ui.warn(f"{stored} doesn't exist yet; it is backed up as soon as it does.")
+            ui.say(f"Added {stored}  ->  USB: {cfg.extra_key(p)}")
+        else:
+            if not present:
+                ui.warn(f"{stored} is not in the list.")
+                continue
+            for x in present:
+                listed.remove(x)  # removes the setting only; files and USB copies stay
+            changed = True
+            ui.say(f"Removed {stored} from the list. Nothing was deleted: its copy stays on the USB "
+                   f"at {cfg.extra_key(p)}, and the files stay where they are.")
+    if changed:
+        write_json(cfg.path, raw)
+        ui.say("The daemon picks this up on its next pass (within a minute).")
     return 0
 
 
@@ -2282,6 +2480,11 @@ def build_parser():
 
     common(sub.add_parser("status", help="this computer and the USB"))
     common(sub.add_parser("verify", help="re-read every file on the USB"))
+    sp = common(sub.add_parser("extras", help="extra folders/files to back up besides Documents and Downloads"),
+                vault=False)
+    sp.add_argument("action", choices=["list", "add", "remove"])
+    sp.add_argument("paths", nargs="*", help="folders or files, e.g. ~/Pictures/Scans ~/.zshrc")
+
     common(sub.add_parser("config", help="show the settings file"), vault=False)
     return p
 
@@ -2294,7 +2497,7 @@ def main(argv=None):
     handlers = {
         "init": cmd_init, "first-run": cmd_first_run, "sync": cmd_sync, "watch": cmd_watch,
         "install-daemon": cmd_install_daemon, "status": cmd_status, "verify": cmd_verify,
-        "config": cmd_config,
+        "config": cmd_config, "extras": cmd_extras,
     }
     try:
         return handlers[args.cmd](args)

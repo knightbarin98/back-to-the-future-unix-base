@@ -26,7 +26,7 @@ tidy. **It never deletes anything.** Deleting is something only you do, by hand.
 | Identical content (checked by SHA-256, whatever the name) | The **newest** copy stays where it is; older copies move to `~/Documents/AttackOfTheClones/<original path>`, listed in `AttackOfTheClones/duplicates.csv` |
 | DICOM studies (`.dcm` or the DICOM signature inside the file) | The whole study folder moves to `~/Documents/OldWorld/` and is **never copied** |
 | `.mkv .mp4 .mov .avi .webm .iso`, installers (`.dmg .pkg .mpkg .app .deb .rpm .AppImage .snap .flatpak .run .exe .msi`), archives over 1 GB | Never copied; they stay where they are |
-| `~/Documents/code` and every git repository | Left alone: not copied, not moved |
+| `~/Documents/code` and every git repository | Left alone: not copied, not moved (unless you add one as an extra) |
 | Logs, the local database and a copy of the USB database | `~/Documents/TimeIsRelative/` on every computer, never copied |
 
 These rules have some details worth knowing:
@@ -42,6 +42,46 @@ These rules have some details worth knowing:
 - **Deleting by hand on Linux** is respected: a file you delete there is marked
   as deleted and not copied back. It stays on the USB and the other computers
   until you delete it there too.
+
+## Extra folders and files
+
+Besides Documents and Downloads, you can back up any folder or file you choose:
+
+```bash
+python usbvault.py extras add ~/Pictures/Scans ~/.zshrc ~/Documents/code/my-project
+```
+
+```bash
+python usbvault.py extras list
+```
+
+```bash
+python usbvault.py extras remove ~/Pictures/Scans
+```
+
+- **Where they go:** `VAULT/Extras/<computer name>/<path from your home>`. For
+  example, `~/Pictures/Scans` on the Mac becomes `Extras/<Mac name>/Pictures/Scans`.
+  Paths outside your home (another disk, for example) go under `.../_root/<full path>`.
+- **Each computer has its own Extras folder,** because things like `~/.zshrc`
+  differ between the Mac and Linux and must not be mixed.
+- **They are copied, never moved:** no FreezeSolo, no AttackOfTheClones, no
+  OldWorld.
+- **Inside a folder you list,** the usual exclusions still apply: videos, ISOs,
+  installers, archives over 1 GB, DICOM files, `node_modules`, `.venv`, `.git`.
+  A **file you list by name is always copied**, even a video.
+- **Not accepted:** your whole home, anything containing Documents or
+  Downloads, and anything already synced through Documents or Downloads.
+  Folders inside `~/Documents/code` or inside a git repository *are* accepted,
+  since those aren't synced otherwise.
+- **On Ubuntu and EndeavourOS,** each computer's own extras sync both ways, so
+  after a reinstall, `extras add` the same paths and the next sync brings them
+  back. A Mac's extras are never copied onto Linux; they stay on the Mac and
+  the USB.
+- **`extras remove`** only stops backing a path up. Nothing is deleted, on the
+  computer or on the USB.
+- **No restart needed:** the daemon reads the list on every pass.
+- **Mac:** Full Disk Access (install step 4) also covers extra folders such as
+  `~/Pictures` or `~/Desktop`.
 
 ## The daemon
 
@@ -119,6 +159,7 @@ until its first run is done.
 python usbvault.py status      # this computer, what's queued for the USB, the USB catalogue
 python usbvault.py sync        # one daemon pass, by hand
 python usbvault.py verify      # re-read every file on the USB and compare checksums
+python usbvault.py extras list # extra folders/files being backed up
 python usbvault.py config      # show the settings (~/.config/usbvault/config.json)
 python usbvault.py install-daemon --remove   # stop the daemon (its file is kept, renamed)
 ```

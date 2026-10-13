@@ -310,6 +310,98 @@ class VaultTest(unittest.TestCase):
         self.assertTrue(self.on_usb("Documents/AttackOfTheClones/Documents/manual.pdf"))
         self.assertFalse(self.on_usb("Documents/manual.pdf"))
 
+    # ------------------------------------------------------------------- extras
+
+    def test_extra_folders_and_files_go_to_the_usb(self):
+        m = self.mac
+        m.write("Pictures/Scans/a.jpg", "scan a")
+        m.write("Pictures/Scans/sub/b.txt", "b")
+        m.write("Pictures/Scans/clip.mp4", "video")              # excluded type inside a listed folder
+        m.write("Pictures/Scans/old.txt", "old", age_days=400)   # extras are never frozen
+        m.write("Pictures/Scans/node_modules/x.js", "x")
+        m.write("Pictures/Scans/ct/IM0001", dicom(1))            # DICOM inside an extra: not copied, not moved
+        m.write("Pictures/other.jpg", "not listed")
+        m.write(".zshrc", "export X=1")
+        m.write("Videos/keep.mp4", "listed by name, so copied")
+        m.write("Documents/code/proj/main.py", "code I want backed up")
+        outside = self.tmp / "outside" / "notes.txt"
+        outside.parent.mkdir()
+        outside.write_text("outside home")
+        out = m.ok("extras", "add", "~/Pictures/Scans", "~/.zshrc", "~/Videos/keep.mp4", str(outside),
+                   "~/Documents/code/proj")
+        self.assertEqual(out.count("Added"), 5)
+        m.write("Documents/cv.pdf", "cv")
+        m.ok("first-run", "--yes")
+        x = self.usb / "Extras/mac"
+        self.assertEqual((x / "Pictures/Scans/a.jpg").read_text(), "scan a")
+        self.assertTrue((x / "Pictures/Scans/sub/b.txt").exists())
+        self.assertTrue((x / "Pictures/Scans/old.txt").exists())
+        self.assertTrue(m.exists("Pictures/Scans/old.txt"))
+        self.assertFalse((x / "Pictures/Scans/clip.mp4").exists())
+        self.assertFalse((x / "Pictures/Scans/node_modules").exists())
+        self.assertFalse((x / "Pictures/Scans/ct/IM0001").exists())
+        self.assertTrue(m.exists("Pictures/Scans/ct/IM0001"))
+        self.assertFalse(m.exists("Documents/OldWorld"))
+        self.assertFalse((x / "Pictures/other.jpg").exists())
+        self.assertEqual((x / ".zshrc").read_text(), "export X=1")
+        self.assertTrue((x / "Videos/keep.mp4").exists())
+        self.assertTrue((x / "Documents/code/proj/main.py").exists())
+        self.assertTrue((x / "_root" / str(outside).lstrip("/")).exists())
+        self.assertFalse(self.on_usb("Documents/code"))  # code is still not synced as Documents
+        out = m.ok("status")
+        self.assertIn("extra paths backed up", out)
+
+    def test_extras_refuses_what_is_already_backed_up(self):
+        m = self.mac
+        m.write("Documents/thesis/.git/HEAD", "ref")
+        out = m.ok("extras", "add", "~/Documents/Facturas", "~", "~/Documents/TimeIsRelative",
+                   "~/Documents/thesis")
+        self.assertIn("Documents/Facturas not added", out)
+        self.assertIn("whole home", out)
+        self.assertIn("never copied", out)
+        self.assertIn("Added ~/Documents/thesis", out)  # a git repository is not synced otherwise
+        self.assertEqual(json.loads(m.config.read_text())["extra_paths"], ["~/Documents/thesis"])
+
+    def test_extras_are_never_moved_as_duplicates(self):
+        m = self.mac
+        m.write("Pictures/Scans/a.jpg", "same bytes", age_days=30)
+        m.ok("extras", "add", "~/Pictures/Scans")
+        m.ok("first-run", "--yes")
+        m.write("Downloads/a-again.jpg", "same bytes")
+        m.ok("watch", "--once")
+        self.assertTrue(m.exists("Pictures/Scans/a.jpg"))
+        self.assertFalse(m.exists("Documents/AttackOfTheClones"))
+        self.assertTrue(self.on_usb("Downloads/a-again.jpg"))
+
+    def test_linux_gets_back_its_own_extras_but_not_the_macs(self):
+        self.mac.write(".zshrc", "mac shell")
+        self.mac.ok("extras", "add", "~/.zshrc")
+        self.mac.ok("first-run", "--yes")
+        self.linux.write("Pictures/Scans/l.jpg", "linux scan")
+        self.linux.ok("extras", "add", "~/Pictures/Scans")
+        self.linux.ok("first-run", "--yes")
+        self.assertTrue(self.on_usb("Extras/ubuntu/Pictures/Scans/l.jpg"))
+        self.assertFalse(self.linux.exists(".zshrc"))
+        # the Ubuntu PC is reinstalled: same name, empty home
+        (self.tmp / "reinstalled").mkdir()
+        fresh = Computer(self.tmp / "reinstalled", "ubuntu", "replica")
+        fresh.env["USBVAULT_MOUNT_ROOTS"] = str(self.mnt)
+        fresh.ok("extras", "add", "~/Pictures/Scans")
+        fresh.ok("first-run", "--yes")
+        self.assertEqual(fresh.read("Pictures/Scans/l.jpg"), "linux scan")
+        self.assertFalse(fresh.exists(".zshrc"))
+
+    def test_removing_an_extra_deletes_nothing(self):
+        m = self.mac
+        m.write("Pictures/Scans/a.jpg", "a")
+        m.ok("extras", "add", "~/Pictures/Scans")
+        m.ok("first-run", "--yes")
+        out = m.ok("extras", "remove", "~/Pictures/Scans")
+        self.assertIn("Nothing was deleted", out)
+        m.ok("watch", "--once")
+        self.assertTrue(m.exists("Pictures/Scans/a.jpg"))
+        self.assertTrue(self.on_usb("Extras/mac/Pictures/Scans/a.jpg"))
+
     # --------------------------------------------------------------- no deletes
 
     def test_the_program_never_deletes_files(self):
