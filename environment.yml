@@ -1,0 +1,13 @@
+# Conda environment for usbvault. The script only uses the Python standard
+# library; the environment pins the same Python on macOS, Ubuntu and
+# EndeavourOS and gives the daemons an interpreter path that system or
+# Homebrew upgrades don't move.
+#
+#   conda env create -f environment.yml      (or just run ./setup.sh)
+name: usbvault
+channels:
+  - conda-forge
+  - nodefaults
+dependencies:
+  - python=3.12
+  - sqlite
